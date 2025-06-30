@@ -9,6 +9,25 @@ use solana_sdk::{
 };
 use spl_token::instruction::{initialize_mint, mint_to, transfer};
 use std::str::FromStr;
+use std::fmt;
+
+// Custom error type
+#[derive(Debug)]
+struct AppError(String);
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl actix_web::error::ResponseError for AppError {
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::BadRequest().json(ApiResponse::<()>::error(self.0.clone()))
+    }
+}
 
 // Standard response structures
 #[derive(Serialize)]
@@ -81,13 +100,6 @@ struct VerifyMessageRequest {
     pubkey: String,
 }
 
-#[derive(Serialize)]
-struct VerifyMessageResponse {
-    valid: bool,
-    message: String,
-    pubkey: String,
-}
-
 #[derive(Deserialize, Debug)]
 struct SendSolRequest {
     from: String,
@@ -138,6 +150,13 @@ struct TokenAccountInfo {
     is_signer: bool,
 }
 
+#[derive(Serialize)]
+struct VerifyMessageResponse {
+    valid: bool,
+    message: String,
+    pubkey: String,
+}
+
 // Request logging middleware
 struct RequestLogger;
 
@@ -175,8 +194,8 @@ where
     actix_web::dev::forward_ready!(service);
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        println!("📥 Incoming Request: {} {}", req.method(), req.path());
-        println!("📥 Headers: {:?}", req.headers());
+        println!("Incoming Request: {} {}", req.method(), req.path());
+        println!("Headers: {:?}", req.headers());
         
         // Extract and log request body for POST requests
         let method = req.method().clone();
@@ -189,9 +208,9 @@ where
             
             if content_type.contains("application/json") {
                 // For JSON requests, we'll log what we can from headers
-                println!("📥 Content-Type: {}", content_type);
+                println!("Content-Type: {}", content_type);
                 if let Some(content_length) = req.headers().get("content-length") {
-                    println!("📥 Content-Length: {:?}", content_length);
+                    println!("Content-Length: {:?}", content_length);
                 }
             }
         }
@@ -199,27 +218,44 @@ where
         let fut = self.service.call(req);
         Box::pin(async move {
             let res = fut.await?;
-            println!("📤 Response Status: {} for {} {}", res.status(), method, path);
+            println!("Response Status: {} for {} {}", res.status(), method, path);
             Ok(res)
         })
     }
 }
 
 // Helper functions
-fn parse_pubkey(key_str: &str) -> Result<Pubkey, String> {
-    Pubkey::from_str(key_str).map_err(|e| format!("Invalid public key: {}", e))
+fn parse_pubkey(key_str: &str) -> Result<Pubkey, AppError> {
+    if key_str.trim().is_empty() {
+        return Err(AppError("Public key cannot be empty".to_string()));
+    }
+    Pubkey::from_str(key_str.trim()).map_err(|_| AppError("Invalid public key format".to_string()))
 }
 
-fn parse_keypair(secret_str: &str) -> Result<Keypair, String> {
-    let bytes = bs58::decode(secret_str)
+fn parse_keypair(secret_str: &str) -> Result<Keypair, AppError> {
+    if secret_str.trim().is_empty() {
+        return Err(AppError("Secret key cannot be empty".to_string()));
+    }
+    
+    let bytes = bs58::decode(secret_str.trim())
         .into_vec()
-        .map_err(|e| format!("Invalid base58 secret key: {}", e))?;
+        .map_err(|_| AppError("Invalid base58 secret key format".to_string()))?;
 
     if bytes.len() != 64 {
-        return Err("Invalid secret key length".to_string());
+        return Err(AppError("Invalid secret key length".to_string()));
     }
 
-    Keypair::from_bytes(&bytes).map_err(|e| format!("Invalid keypair: {}", e))
+    Keypair::from_bytes(&bytes).map_err(|_| AppError("Invalid keypair format".to_string()))
+}
+
+fn validate_token_amount(amount: u64) -> Result<(), AppError> {
+    if amount == 0 {
+        return Err(AppError("Amount must be greater than 0".to_string()));
+    }
+    if amount > u64::MAX / 2 {
+        return Err(AppError("Amount exceeds maximum allowed value".to_string()));
+    }
+    Ok(())
 }
 
 // Endpoint handlers
@@ -233,105 +269,102 @@ async fn generate_keypair() -> Result<HttpResponse> {
 }
 
 async fn create_token(req: web::Json<CreateTokenRequest>) -> Result<HttpResponse> {
-    println!("📥 POST /token/create body: {:?}", req);
-    match (parse_pubkey(&req.mint_authority), parse_pubkey(&req.mint)) {
-        (Ok(mint_authority), Ok(mint)) => {
-            let instruction = initialize_mint(
-                &spl_token::id(),
-                &mint,
-                &mint_authority,
-                Some(&mint_authority),
-                req.decimals,
-            )
-            .map_err(|e| format!("Failed to create mint instruction: {}", e));
-
-            match instruction {
-                Ok(ix) => {
-                    let accounts: Vec<AccountInfo> = ix
-                        .accounts
-                        .iter()
-                        .map(|acc| AccountInfo {
-                            pubkey: acc.pubkey.to_string(),
-                            is_signer: acc.is_signer,
-                            is_writable: acc.is_writable,
-                        })
-                        .collect();
-
-                    let response_data = InstructionResponse {
-                        program_id: ix.program_id.to_string(),
-                        accounts,
-                        instruction_data: BASE64.encode(&ix.data),
-                    };
-
-                    let response = ApiResponse::success(response_data);
-                    Ok(HttpResponse::Ok().json(response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
-                    Ok(HttpResponse::BadRequest().json(response))
-                }
-            }
-        }
-        _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
-            Ok(HttpResponse::BadRequest().json(response))
-        }
+    println!("POST /token/create body: {:?}", req);
+    
+    // Validate all required fields
+    if req.mint_authority.trim().is_empty() || req.mint.trim().is_empty() {
+        return Err(AppError("Missing required fields".to_string()).into());
     }
+
+    // Validate decimals
+    if req.decimals > 9 {
+        return Err(AppError("Decimals must be between 0 and 9".to_string()).into());
+    }
+
+    // Parse and validate public keys
+    let mint_authority = parse_pubkey(&req.mint_authority)?;
+    let mint = parse_pubkey(&req.mint)?;
+
+    // Create the instruction
+    let instruction = initialize_mint(
+        &spl_token::id(),
+        &mint,
+        &mint_authority,
+        Some(&mint_authority),
+        req.decimals,
+    )
+    .map_err(|e| AppError(format!("Failed to create mint instruction: {}", e)))?;
+
+    let accounts: Vec<AccountInfo> = instruction
+        .accounts
+        .iter()
+        .map(|acc| AccountInfo {
+            pubkey: acc.pubkey.to_string(),
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let response_data = InstructionResponse {
+        program_id: instruction.program_id.to_string(),
+        accounts,
+        instruction_data: BASE64.encode(&instruction.data),
+    };
+
+    Ok(HttpResponse::Ok().json(ApiResponse::success(response_data)))
 }
 
 async fn mint_token(req: web::Json<MintTokenRequest>) -> Result<HttpResponse> {
-    match (
-        parse_pubkey(&req.mint),
-        parse_pubkey(&req.destination),
-        parse_pubkey(&req.authority),
-    ) {
-        (Ok(mint), Ok(destination), Ok(authority)) => {
-            let instruction = mint_to(
-                &spl_token::id(),
-                &mint,
-                &destination,
-                &authority,
-                &[],
-                req.amount,
-            )
-            .map_err(|e| format!("Failed to create mint instruction: {}", e));
+    println!("POST /token/mint body: {:?}", req);
 
-            match instruction {
-                Ok(ix) => {
-                    let accounts: Vec<AccountInfo> = ix
-                        .accounts
-                        .iter()
-                        .map(|acc| AccountInfo {
-                            pubkey: acc.pubkey.to_string(),
-                            is_signer: acc.is_signer,
-                            is_writable: acc.is_writable,
-                        })
-                        .collect();
+    // Validate amount first
+    validate_token_amount(req.amount)?;
 
-                    let response_data = InstructionResponse {
-                        program_id: ix.program_id.to_string(),
-                        accounts,
-                        instruction_data: BASE64.encode(&ix.data),
-                    };
-
-                    let response = ApiResponse::success(response_data);
-                    Ok(HttpResponse::Ok().json(response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
-                    Ok(HttpResponse::BadRequest().json(response))
-                }
-            }
-        }
-        _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
-            Ok(HttpResponse::BadRequest().json(response))
-        }
+    // Validate all required fields
+    if req.mint.trim().is_empty() || req.destination.trim().is_empty() || req.authority.trim().is_empty() {
+        return Err(AppError("Missing required fields".to_string()).into());
     }
+
+    // Parse and validate all public keys first
+    let mint = parse_pubkey(&req.mint)?;
+    let destination = parse_pubkey(&req.destination)?;
+    let authority = parse_pubkey(&req.authority)?;
+
+    // Get the destination ATA
+    let destination_ata = spl_associated_token_account::get_associated_token_address(&destination, &mint);
+
+    // Create the instruction
+    let instruction = mint_to(
+        &spl_token::id(),
+        &mint,
+        &destination_ata,
+        &authority,
+        &[],
+        req.amount,
+    )
+    .map_err(|e| AppError(format!("Failed to create mint instruction: {}", e)))?;
+
+    let accounts: Vec<AccountInfo> = instruction
+        .accounts
+        .iter()
+        .map(|acc| AccountInfo {
+            pubkey: acc.pubkey.to_string(),
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let response_data = InstructionResponse {
+        program_id: instruction.program_id.to_string(),
+        accounts,
+        instruction_data: BASE64.encode(&instruction.data),
+    };
+
+    Ok(HttpResponse::Ok().json(ApiResponse::success(response_data)))
 }
 
 async fn sign_message(req: web::Json<SignMessageRequest>) -> Result<HttpResponse> {
-    println!("📥 POST /message/sign body: {:?}", req);
+    println!("POST /message/sign body: {:?}", req);
     if req.message.is_empty() || req.secret.is_empty() {
         let response = ApiResponse::<()>::error("Missing required fields".to_string());
         return Ok(HttpResponse::BadRequest().json(response));
@@ -352,48 +385,55 @@ async fn sign_message(req: web::Json<SignMessageRequest>) -> Result<HttpResponse
             Ok(HttpResponse::Ok().json(response))
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(e);
+            let response = ApiResponse::<()>::error(e.0);
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
 }
 
 async fn verify_message(req: web::Json<VerifyMessageRequest>) -> Result<HttpResponse> {
-    match parse_pubkey(&req.pubkey) {
-        Ok(pubkey) => {
-            let signature_bytes = match BASE64.decode(&req.signature) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    let response = ApiResponse::<()>::error("Invalid base64 signature".to_string());
-                    return Ok(HttpResponse::BadRequest().json(response));
-                }
-            };
-
-            let signature = match Signature::try_from(signature_bytes.as_slice()) {
-                Ok(sig) => sig,
-                Err(_) => {
-                    let response = ApiResponse::<()>::error("Invalid signature format".to_string());
-                    return Ok(HttpResponse::BadRequest().json(response));
-                }
-            };
-
-            let message_bytes = req.message.as_bytes();
-            let valid = signature.verify(&pubkey.to_bytes(), message_bytes);
-
-            let response_data = VerifyMessageResponse {
-                valid,
-                message: req.message.clone(),
-                pubkey: req.pubkey.clone(),
-            };
-
-            let response = ApiResponse::success(response_data);
-            Ok(HttpResponse::Ok().json(response))
-        }
-        Err(e) => {
-            let response = ApiResponse::<()>::error(e);
-            Ok(HttpResponse::BadRequest().json(response))
-        }
+    // Validate all required fields
+    if req.message.trim().is_empty() || req.signature.trim().is_empty() || req.pubkey.trim().is_empty() {
+        return Ok(HttpResponse::BadRequest().json(ApiResponse::<()>::error(
+            "Missing required fields".to_string(),
+        )));
     }
+
+    // Parse public key first
+    let pubkey = match parse_pubkey(&req.pubkey) {
+        Ok(key) => key,
+        Err(e) => return Ok(HttpResponse::BadRequest().json(ApiResponse::<()>::error(e.0))),
+    };
+
+    // Decode and validate signature
+    let signature_bytes = match BASE64.decode(req.signature.trim()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(HttpResponse::BadRequest().json(ApiResponse::<()>::error(
+                "Invalid base64 signature format".to_string(),
+            )))
+        }
+    };
+
+    let signature = match Signature::try_from(signature_bytes.as_slice()) {
+        Ok(sig) => sig,
+        Err(_) => {
+            return Ok(HttpResponse::BadRequest().json(ApiResponse::<()>::error(
+                "Invalid signature format".to_string(),
+            )))
+        }
+    };
+
+    let message_bytes = req.message.as_bytes();
+    let valid = signature.verify(&pubkey.to_bytes(), message_bytes);
+
+    let response_data = VerifyMessageResponse {
+        valid,
+        message: req.message.clone(),
+        pubkey: req.pubkey.clone(),
+    };
+
+    Ok(HttpResponse::Ok().json(ApiResponse::success(response_data)))
 }
 
 async fn send_sol(req: web::Json<SendSolRequest>) -> Result<HttpResponse> {
@@ -430,71 +470,69 @@ async fn send_sol(req: web::Json<SendSolRequest>) -> Result<HttpResponse> {
 }
 
 async fn send_token(req: web::Json<SendTokenRequest>) -> Result<HttpResponse> {
-    println!("📥 POST /send/token body: {:?}", req);
-    if req.amount == 0 {
-        let response =
-            ApiResponse::<()>::error("Invalid amount: must be greater than 0".to_string());
-        return Ok(HttpResponse::BadRequest().json(response));
+    println!("POST /send/token body: {:?}", req);
+    
+    // Validate amount first
+    validate_token_amount(req.amount)?;
+
+    // Validate all required fields
+    if req.destination.trim().is_empty() || req.mint.trim().is_empty() || req.owner.trim().is_empty() {
+        return Err(AppError("Missing required fields".to_string()).into());
     }
 
-    match (
-        parse_pubkey(&req.destination),
-        parse_pubkey(&req.mint),
-        parse_pubkey(&req.owner),
-    ) {
-        (Ok(destination), Ok(mint), Ok(owner)) => {
-            // For SPL token transfer, we need to derive the associated token accounts
-            let source_ata =
-                spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    // Parse and validate all public keys first
+    let destination = parse_pubkey(&req.destination)?;
+    let mint = parse_pubkey(&req.mint)?;
+    let owner = parse_pubkey(&req.owner)?;
 
-            let instruction = transfer(
-                &spl_token::id(),
-                &source_ata,
-                &destination,
-                &owner,
-                &[],
-                req.amount,
-            )
-            .map_err(|e| format!("Failed to create transfer instruction: {}", e));
+    // Derive ATAs for both source and destination
+    let source_ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    let destination_ata = spl_associated_token_account::get_associated_token_address(&destination, &mint);
 
-            match instruction {
-                Ok(ix) => {
-                    let accounts: Vec<TokenAccountInfo> = ix
-                        .accounts
-                        .iter()
-                        .map(|acc| TokenAccountInfo {
-                            pubkey: acc.pubkey.to_string(),
-                            is_signer: acc.is_signer,
-                        })
-                        .collect();
+    // Create the instruction
+    let instruction = transfer(
+        &spl_token::id(),
+        &source_ata,
+        &destination_ata,
+        &owner,
+        &[],
+        req.amount,
+    )
+    .map_err(|e| AppError(format!("Failed to create transfer instruction: {}", e)))?;
 
-                    let response_data = TokenInstructionResponse {
-                        program_id: ix.program_id.to_string(),
-                        accounts,
-                        instruction_data: BASE64.encode(&ix.data),
-                    };
+    let accounts: Vec<TokenAccountInfo> = instruction
+        .accounts
+        .iter()
+        .map(|acc| TokenAccountInfo {
+            pubkey: acc.pubkey.to_string(),
+            is_signer: acc.is_signer,
+        })
+        .collect();
 
-                    let response = ApiResponse::success(response_data);
-                    Ok(HttpResponse::Ok().json(response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
-                    Ok(HttpResponse::BadRequest().json(response))
-                }
-            }
-        }
-        _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
-            Ok(HttpResponse::BadRequest().json(response))
-        }
-    }
+    let response_data = TokenInstructionResponse {
+        program_id: instruction.program_id.to_string(),
+        accounts,
+        instruction_data: BASE64.encode(&instruction.data),
+    };
+
+    Ok(HttpResponse::Ok().json(ApiResponse::success(response_data)))
+}
+
+// Add health check endpoint handler
+async fn health_check() -> Result<HttpResponse> {
+    Ok(HttpResponse::Ok().json(ApiResponse::success("Server is running")))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    println!("Starting Solana Fellowship HTTP Server on http://localhost:8080");
+    // Get port from environment variable or use default
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let host = "0.0.0.0";
+    let addr = format!("{}:{}", host, port);
+
+    println!("Starting Solana Fellowship HTTP Server on {}", addr);
     HttpServer::new(|| {
         App::new()
             .wrap(Logger::default())
@@ -507,6 +545,9 @@ async fn main() -> std::io::Result<()> {
                     ))
                 ).into()
             }))
+            // Add health check endpoint
+            .route("/health", web::get().to(health_check))
+            .route("/", web::get().to(health_check))
             .route("/keypair", web::post().to(generate_keypair))
             .route("/token/create", web::post().to(create_token))
             .route("/token/mint", web::post().to(mint_token))
@@ -515,7 +556,7 @@ async fn main() -> std::io::Result<()> {
             .route("/send/sol", web::post().to(send_sol))
             .route("/send/token", web::post().to(send_token))
     })
-    .bind("127.0.0.1:8080")?
+    .bind(&addr)?
     .run()
     .await
 }
